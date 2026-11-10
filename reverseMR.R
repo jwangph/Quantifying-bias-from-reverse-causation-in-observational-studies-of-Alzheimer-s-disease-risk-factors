@@ -176,13 +176,19 @@ LIFE_TABLE$annual_hazard <- -log(1 - LIFE_TABLE$q5) / 5
 
 # per 5 BMI units (Global BMI Mortality Collaboration, Lancet 2016).
 MORT <- list(bmi_hr_per_5 = 1.30, preAD_hr_per_unit = 1.10,
-             C_hr_per_sd = 1.10, U_hr_per_sd = 1.10, female_hr = 0.80)
+             C_hr_per_sd = 1.10, U_hr_per_sd = 1.10, female_hr = 0.80,
+             positive_interaction_hr = 4.0)
+
+MORTALITY_MODES <- c("none", "mortality", "mortality_positive_interaction")
+MORTALITY_LABELS <- c("No mortality", "Mortality: no interaction",
+                      "Mortality: positive interaction")
 
 get_BMI_at_age <- function(age, pop, cfg) {
   BMI_mean(age, pop, cfg) + pop$bmi_error
 }
 
 death_hazard <- function(age, subpop, cfg, mode) {
+  if (!mode %in% MORTALITY_MODES) stop("Unknown mortality mode: ", mode)
   if (mode == "none") return(rep(0, nrow(subpop)))
   band <- floor((age - 45) / 5) + 1L
   base <- LIFE_TABLE$annual_hazard[band]
@@ -194,6 +200,17 @@ death_hazard <- function(age, subpop, cfg, mode) {
     log(MORT$C_hr_per_sd) * subpop$C / 3 +
     log(MORT$U_hr_per_sd) * subpop$U +
     log(MORT$female_hr) * (subpop$sex - 0.5)
+  
+  # Additional positive joint effect on the *mortality hazard* only.
+  # It is active only when BMI > 25 AND the latent preclinical AD score is
+  # above the original age-specific reference value. Main effects and
+  # centering in the original mortality model are unchanged.
+  if (mode == "mortality_positive_interaction") {
+    bmi_excess <- pmax(prior_bmi - 25, 0) / 5
+    preAD_excess <- pmax(preAD - center_preAD, 0)
+    eta <- eta + log(MORT$positive_interaction_hr) * bmi_excess * preAD_excess
+  }
+  
   base * exp(pmin(eta, 15))
 }
 
@@ -337,7 +354,7 @@ if (RUN_MORTALITY) {
   for (r in seq_len(N_REPS)) {
     pop <- make_population(N_POP, 800000L + r, cfg, persistent_error = TRUE)
     for (truth in c(1, 1.3)) {
-      for (mode in c("none", "mortality")) {
+      for (mode in MORTALITY_MODES) {
         set.seed(2000000L + 1000L * r +
                    (if (truth == 1) 13L else 41L))
         history <- prebaseline_histories(pop, cfg, truth, mode)
@@ -396,13 +413,44 @@ PRIMARY_SUM <- NULL
 MORT_SUM <- NULL
 if (!is.null(PRIMARY_EST)) {
   PRIMARY_SUM <- summarize_mc(PRIMARY_EST,
-                               c("scenario", "HR_BMI", "baseline_age", "exposure"))
+                              c("scenario", "HR_BMI", "baseline_age", "exposure"))
   write.csv(PRIMARY_SUM, file.path(OUT_DIR, "primary_MC_summary.csv"), row.names = FALSE)
 }
 if (!is.null(MORT_EST)) {
   MORT_SUM <- summarize_mc(MORT_EST,
-                            c("mode", "HR_BMI", "baseline_age", "exposure"))
+                           c("mode", "HR_BMI", "baseline_age", "exposure"))
   write.csv(MORT_SUM, file.path(OUT_DIR, "mortality_MC_summary.csv"), row.names = FALSE)
+  
+  # Direct comparison for the response to the survival-selection reviewer.
+  # Negative differences in log HR indicate a more inverse association in
+  # the positive-interaction scenario (not necessarily a larger causal bias).
+  key_cols <- c("HR_BMI", "baseline_age", "exposure")
+  hr_for_mode <- function(mode, name) {
+    d <- MORT_SUM[MORT_SUM$mode == mode, c(key_cols, "HR"), drop = FALSE]
+    names(d)[names(d) == "HR"] <- name
+    d
+  }
+  mort_compare <- Reduce(function(x, y) merge(x, y, by = key_cols, all = TRUE),
+                         list(hr_for_mode("none", "HR_no_mortality"),
+                              hr_for_mode("mortality", "HR_standard_mortality"),
+                              hr_for_mode("mortality_positive_interaction",
+                                          "HR_positive_interaction")))
+  mort_compare$delta_logHR_positive_vs_standard <-
+    log(mort_compare$HR_positive_interaction) -
+    log(mort_compare$HR_standard_mortality)
+  mort_compare$delta_logHR_positive_vs_no_mortality <-
+    log(mort_compare$HR_positive_interaction) -
+    log(mort_compare$HR_no_mortality)
+  write.csv(mort_compare, file.path(OUT_DIR, "mortality_interaction_comparison.csv"),
+            row.names = FALSE)
+  
+  mortality_eligibility <- aggregate(
+    cbind(n_eligible, proportion_eligible, n_prior_AD, n_prior_death) ~
+      mode + HR_BMI + baseline_age,
+    data = MORT_DIAG, FUN = mean)
+  write.csv(mortality_eligibility,
+            file.path(OUT_DIR, "mortality_eligibility_summary.csv"),
+            row.names = FALSE)
 }
 
 saveRDS(list(primary_summary = PRIMARY_SUM, mortality_summary = MORT_SUM,
@@ -426,7 +474,7 @@ common_limits <- function(lo, hi, floor_limit = MIN_HR_YLIM) {
 }
 if (!is.null(PRIMARY_SUM) && !is.null(MORT_SUM)) {
   COMMON_HR_Y <- common_limits(c(PRIMARY_SUM$HRlci, MORT_SUM$HRlci),
-                                c(PRIMARY_SUM$HRuci, MORT_SUM$HRuci))
+                               c(PRIMARY_SUM$HRuci, MORT_SUM$HRuci))
 } else if (!is.null(PRIMARY_SUM)) {
   COMMON_HR_Y <- common_limits(PRIMARY_SUM$HRlci, PRIMARY_SUM$HRuci)
 } else {
@@ -495,8 +543,8 @@ if (!is.null(PRIMARY_SUM)) {
 plot_mortality_style <- function(df, truth, outfile, ylims = COMMON_HR_Y) {
   d <- df[df$HR_BMI == truth, , drop = FALSE]
   d$Exposure <- factor(d$exposure, levels = c("BMI", "Obesity"))
-  d$Mortality <- factor(d$mode, levels = c("none", "mortality"),
-                        labels = c("No mortality", "Mortality"))
+  d$Mortality <- factor(d$mode, levels = MORTALITY_MODES,
+                        labels = MORTALITY_LABELS)
   ref <- data.frame(Exposure = if (truth == 1) c("BMI", "Obesity") else "BMI",
                     yint = truth)
   ref$Exposure <- factor(ref$Exposure, levels = levels(d$Exposure))
@@ -507,7 +555,7 @@ plot_mortality_style <- function(df, truth, outfile, ylims = COMMON_HR_Y) {
                   position = dodger, width = 0.18) +
     geom_hline(data = ref, aes(yintercept = yint), linetype = "dashed",
                color = "grey40", inherit.aes = FALSE) +
-    scale_shape_manual(values = c(16, 1)) +
+    scale_shape_manual(values = c(16, 1, 17)) +
     scale_x_continuous(breaks = ENTRY_AGES) +
     facet_wrap(~ Exposure, ncol = 2, scales = "fixed") +
     coord_cartesian(ylim = ylims) +
@@ -516,20 +564,24 @@ plot_mortality_style <- function(df, truth, outfile, ylims = COMMON_HR_Y) {
          shape = NULL) +
     paper_theme() +
     theme(legend.position = "bottom")
-  ggsave(outfile, p, width = 7, height = 4.4)
+  ggsave(outfile, p, width = 8, height = 4.4)
 }
 
+
+# S7: standard mortality model ONLY (no BMI x preclinical AD interaction).
+# S8: positive BMI x preclinical AD mortality interaction
 if (!is.null(MORT_SUM)) {
+  s7 <- MORT_SUM[MORT_SUM$mode == "mortality", , drop = FALSE]
+  s8 <- MORT_SUM[MORT_SUM$mode == "mortality_positive_interaction", , drop = FALSE]
   
-  mortality_only <- MORT_SUM[MORT_SUM$mode == "mortality", , drop = FALSE]
-  if (nrow(mortality_only)) {
-    plot_original_style(mortality_only, file.path(FIG_DIR, "SuppFig7.pdf"))
-  }
+  if (nrow(s7) == 0L) stop("Cannot plot S7: no standard mortality estimates in MORT_SUM")
+  if (nrow(s8) == 0L) stop("Cannot plot S8: no positive-interaction estimates in MORT_SUM")
   
-  plot_mortality_style(MORT_SUM, 1,
-                       file.path(FIG_DIR, "Mortality_Scenario1_NoCausalEffect.pdf"))
-  plot_mortality_style(MORT_SUM, 1.3,
-                       file.path(FIG_DIR, "Mortality_Scenario2_HarmfulEffect.pdf"))
+  # Match the original S7 style in both figures, with identical y-axis limits.
+  plot_original_style(s7, file.path(FIG_DIR, "SuppFig7.pdf"),
+                      ylims = COMMON_HR_Y)
+  plot_original_style(s8, file.path(FIG_DIR, "SuppFig8.pdf"),
+                      ylims = COMMON_HR_Y)
 }
 
 if (!is.null(PRIMARY_SUM)) {
@@ -559,19 +611,19 @@ if (!is.null(PRIMARY_SUM)) {
   ggsave(file.path(FIG_DIR, "SuppFig1B.pdf"), p_b, width = 8, height = 4)
   adgrs_rows <- lapply(list(c(45,49), c(50,59), c(60,69), c(70,79), c(80,89)),
                        function(bounds) {
-    grid <- expand.grid(G = seq(-2, 2, length.out = 10),
-                        age = bounds[1]:bounds[2],
-                        U = seq(-2, 2, length.out = 10),
-                        C = seq(-2, 2, length.out = 10))
-    grid$sex <- 0; grid$educ <- 0
-    bmi <- BMI_mean(grid$age, grid, cfg)
-    fit <- lm(bmi ~ G, data = grid)
-    b <- summary(fit)$coefficients["G", c("Estimate", "Std. Error")]
-    data.frame(Age = paste0(if (bounds[1] == 45) 40 else bounds[1], "-",
-                            bounds[2] + 1), beta = unname(b[1]),
-               lo = unname(b[1] - 1.96 * b[2]),
-               hi = unname(b[1] + 1.96 * b[2]), Source = "Simulated")
-  })
+                         grid <- expand.grid(G = seq(-2, 2, length.out = 10),
+                                             age = bounds[1]:bounds[2],
+                                             U = seq(-2, 2, length.out = 10),
+                                             C = seq(-2, 2, length.out = 10))
+                         grid$sex <- 0; grid$educ <- 0
+                         bmi <- BMI_mean(grid$age, grid, cfg)
+                         fit <- lm(bmi ~ G, data = grid)
+                         b <- summary(fit)$coefficients["G", c("Estimate", "Std. Error")]
+                         data.frame(Age = paste0(if (bounds[1] == 45) 40 else bounds[1], "-",
+                                                 bounds[2] + 1), beta = unname(b[1]),
+                                    lo = unname(b[1] - 1.96 * b[2]),
+                                    hi = unname(b[1] + 1.96 * b[2]), Source = "Simulated")
+                       })
   adgrs_df <- do.call(rbind, adgrs_rows)
   published <- data.frame(Age = c("40-50", "50-60", "60-70"),
                           beta = c(0, -0.03, -0.09),
@@ -593,11 +645,6 @@ if (!is.null(PRIMARY_SUM)) {
 
 message("All output saved to: ", normalizePath(OUT_DIR))
 message("Shared HR figure y-axis: ", paste(COMMON_HR_Y, collapse = " to "))
-
-
-
-
-
 
 
 
